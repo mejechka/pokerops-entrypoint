@@ -12,8 +12,15 @@ readonly PLANNER_PGSERVICE='pokerops-planner-migration'
 readonly PG_SERVICE_FILE='/root/.pg_service.conf'
 readonly INSTALL_ROOT='/opt/pokerops-tournament-ingestion'
 readonly RUNTIME_ENV='/opt/pokerops-tournament-ingestion/shared/.env.tournament.local'
+readonly MIGRATION_ENV='/opt/pokerops-tournament-ingestion/shared/.env.migration'
 temporary_root=''
+pg_service_temp=''
 planner_pgservice=''
+migration_host=''
+migration_port=''
+migration_user=''
+migration_database=''
+migration_sslmode=''
 
 die() { printf '%s\n' "$*" >&2; exit 1; }
 
@@ -29,6 +36,111 @@ env_value() {
       }
     }
   ' "$file"
+}
+
+url_decode() {
+  local input="$1" output='' prefix hex decoded
+  while [[ "$input" == *%* ]]; do
+    prefix="${input%%\%*}"
+    output+="$prefix"
+    input="${input#*%}"
+    [[ "${#input}" -ge 2 ]] || return 1
+    hex="${input:0:2}"
+    [[ "$hex" =~ ^[0-9A-Fa-f]{2}$ && "$hex" != '00' ]] || return 1
+    printf -v decoded '%b' "\\x${hex}"
+    output+="$decoded"
+    input="${input:2}"
+  done
+  printf '%s' "${output}${input}"
+}
+
+cleanup() {
+  local status=$?
+  trap - EXIT INT TERM
+  unset PGPASSWORD
+  if [[ -n "$pg_service_temp" && -f "$pg_service_temp" ]]; then
+    [[ "$pg_service_temp" == /root/.pg_service.conf.tmp.* ]] || exit 1
+    rm -f -- "$pg_service_temp"
+  fi
+  if [[ -n "$temporary_root" && -d "$temporary_root" ]]; then
+    [[ "$temporary_root" == /tmp/pokerops-public-entrypoint.* ]] || exit 1
+    rm -rf -- "$temporary_root"
+  fi
+  exit "$status"
+}
+
+load_migration_env_credentials() {
+  local migration_url prefix remainder encoded_password endpoint authority_path query decoded_password
+  [[ -f "$MIGRATION_ENV" && ! -L "$MIGRATION_ENV" ]] \
+    || die 'sealed migration env is missing or is a symlink'
+  [[ "$(stat -c '%U:%G:%a' "$MIGRATION_ENV")" == 'root:root:600' ]] \
+    || die 'sealed migration env must be root:root mode 0600'
+  [[ "$(grep -cE '^MIGRATION_DATABASE_URL=' "$MIGRATION_ENV")" == '1' ]] \
+    || die 'sealed migration env must contain exactly one MIGRATION_DATABASE_URL'
+  migration_url="$(env_value "$MIGRATION_ENV" MIGRATION_DATABASE_URL)"
+
+  if [[ "$migration_url" == "postgresql://postgres.${PROJECT_REF}:"* ]]; then
+    prefix="postgresql://postgres.${PROJECT_REF}:"
+    migration_user="postgres.${PROJECT_REF}"
+  elif [[ "$migration_url" == 'postgresql://postgres:'* ]]; then
+    prefix='postgresql://postgres:'
+    migration_user='postgres'
+  else
+    die 'MIGRATION_DATABASE_URL must use the PokerOps postgres role'
+  fi
+  remainder="${migration_url#"$prefix"}"
+  [[ "$remainder" == *@* ]] || die 'MIGRATION_DATABASE_URL is malformed'
+  endpoint="${remainder#*@}"
+  [[ "$endpoint" != *@* ]] || die 'MIGRATION_DATABASE_URL contains an unescaped password character'
+  encoded_password="${remainder%%@*}"
+  [[ -n "$encoded_password" ]] || die 'MIGRATION_DATABASE_URL password is empty'
+  [[ "$endpoint" == *\?* ]] || die 'MIGRATION_DATABASE_URL query parameters are missing'
+  authority_path="${endpoint%%\?*}"
+  query="${endpoint#*\?}"
+  [[ "&${query}&" == *'&sslmode=require&'* ]] \
+    || die 'MIGRATION_DATABASE_URL must require TLS'
+
+  if [[ "$migration_user" == "postgres.${PROJECT_REF}" ]]; then
+    [[ "$authority_path" =~ ^([A-Za-z0-9.-]+\.pooler\.supabase\.com):5432/postgres$ ]] \
+      || die 'MIGRATION_DATABASE_URL must use Supabase session pooler port 5432'
+    migration_host="${BASH_REMATCH[1]}"
+  else
+    [[ "$authority_path" == "db.${PROJECT_REF}.supabase.co:5432/postgres" ]] \
+      || die 'direct MIGRATION_DATABASE_URL must target the PokerOps project on port 5432'
+    migration_host="db.${PROJECT_REF}.supabase.co"
+  fi
+  decoded_password="$(url_decode "$encoded_password")" \
+    || die 'MIGRATION_DATABASE_URL password encoding is invalid'
+  [[ -n "$decoded_password" && "$decoded_password" != *$'\n'* && "$decoded_password" != *$'\r'* ]] \
+    || die 'decoded migration password is invalid'
+  migration_port='5432'
+  migration_database='postgres'
+  migration_sslmode='require'
+  export PGPASSWORD="$decoded_password"
+  unset decoded_password encoded_password migration_url remainder
+}
+
+ensure_pg_service_file() {
+  if [[ -e "$PG_SERVICE_FILE" || -L "$PG_SERVICE_FILE" ]]; then
+    return
+  fi
+  load_migration_env_credentials
+  pg_service_temp="$(mktemp /root/.pg_service.conf.tmp.XXXXXX)"
+  chmod 0600 "$pg_service_temp"
+  chown root:root "$pg_service_temp"
+  printf '%s\n' \
+    "[${PLANNER_PGSERVICE}]" \
+    "host=${migration_host}" \
+    "port=${migration_port}" \
+    "dbname=${migration_database}" \
+    "user=${migration_user}" \
+    "sslmode=${migration_sslmode}" \
+    "application_name=pokerops_planner_migration" \
+    >"$pg_service_temp"
+  [[ ! -e "$PG_SERVICE_FILE" && ! -L "$PG_SERVICE_FILE" ]] \
+    || die 'root pg_service file appeared during bootstrap'
+  mv -- "$pg_service_temp" "$PG_SERVICE_FILE"
+  pg_service_temp=''
 }
 
 validate_runtime_env() {
@@ -136,6 +248,24 @@ resolve_migration_service() {
   done < <(pg_service_sections)
   [[ "$approved_count" == '1' ]] \
     || die 'pg_service file must contain exactly one approved PokerOps admin service'
+}
+
+ensure_migration_password() {
+  local configured_password host port user database sslmode
+  [[ -n "${PGPASSWORD:-}" ]] && return
+  configured_password="$(pg_service_value "$PG_SERVICE_FILE" "$planner_pgservice" password)"
+  [[ -z "$configured_password" ]] || return
+  load_migration_env_credentials
+  host="$(pg_service_value "$PG_SERVICE_FILE" "$planner_pgservice" host)"
+  port="$(pg_service_value "$PG_SERVICE_FILE" "$planner_pgservice" port)"
+  user="$(pg_service_value "$PG_SERVICE_FILE" "$planner_pgservice" user)"
+  database="$(pg_service_value "$PG_SERVICE_FILE" "$planner_pgservice" dbname)"
+  sslmode="$(pg_service_value "$PG_SERVICE_FILE" "$planner_pgservice" sslmode)"
+  [[ -n "$port" ]] || port='5432'
+  [[ "$host" == "$migration_host" && "$port" == "$migration_port" \
+    && "$user" == "$migration_user" && "$database" == "$migration_database" \
+    && "$sslmode" == "$migration_sslmode" ]] \
+    || die 'sealed migration env does not match the approved pg_service endpoint'
 }
 
 validate_migration_service() {
@@ -249,16 +379,19 @@ main() {
   [[ "$(id -u)" == '0' ]] || die 'run through sudo bash'
   [[ "$WRAPPER_COMMIT" =~ ^[0-9a-f]{40}$ ]] || die 'wrapper commit must be immutable'
 
+  umask 077
+  trap cleanup EXIT INT TERM
+
   validate_dependencies
   validate_github_access
   validate_runtime_env
+  ensure_pg_service_file
   resolve_migration_service
+  ensure_migration_password
   validate_migration_service
   validate_disk_space
 
-  umask 077
   temporary_root="$(mktemp -d /tmp/pokerops-public-entrypoint.XXXXXX)"
-  trap '[[ -z "$temporary_root" ]] || rm -rf -- "$temporary_root"' EXIT INT TERM
   phase_a_wrapper="$temporary_root/deploy.sh"
   gh api \
     -H 'Accept: application/vnd.github.raw+json' \
