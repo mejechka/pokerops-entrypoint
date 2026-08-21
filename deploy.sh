@@ -35,4 +35,3 @@ chmod 0700 "$private_wrapper"
 POKEROPS_PLANNER_PHASE_A_APPROVED=YES \
 POKEROPS_PLANNER_PGSERVICE="$PLANNER_PGSERVICE" \
   bash "$private_wrapper"
-
