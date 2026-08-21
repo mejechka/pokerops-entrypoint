@@ -6,11 +6,13 @@ readonly GITHUB_OWNER='mejechka'
 readonly WRAPPER_COMMIT='d6774a908551b9b0a676f2cf00dcdff7255d5c65'
 readonly WRAPPER_SHA256='1de2af5254414825ea71798c404a326faca70696766e6191e4af2686d63e0154'
 readonly PLANNER_PGSERVICE='pokerops-planner-migration'
+readonly RUNTIME_ENV='/opt/pokerops-tournament-ingestion/shared/.env.tournament.local'
 
 [[ $# -eq 0 ]] || { printf 'usage: deploy.sh\n' >&2; exit 2; }
 [[ "$(id -u)" == '0' ]] || { printf 'run through sudo bash\n' >&2; exit 1; }
 command -v gh >/dev/null || { printf 'gh is required\n' >&2; exit 1; }
 command -v sha256sum >/dev/null || { printf 'sha256sum is required\n' >&2; exit 1; }
+command -v sed >/dev/null || { printf 'sed is required\n' >&2; exit 1; }
 [[ "$WRAPPER_COMMIT" =~ ^[0-9a-f]{40}$ ]] || { printf 'wrapper commit must be immutable\n' >&2; exit 1; }
 
 gh auth status --hostname github.com >/dev/null 2>&1 \
@@ -31,6 +33,24 @@ gh api \
   >"$private_wrapper"
 printf '%s  %s\n' "$WRAPPER_SHA256" "$private_wrapper" | sha256sum -c - >/dev/null
 chmod 0700 "$private_wrapper"
+
+[[ -f "$RUNTIME_ENV" && ! -L "$RUNTIME_ENV" ]] \
+  || { printf 'sealed runtime env is missing or is a symlink\n' >&2; exit 1; }
+[[ "$(stat -c '%U:%G:%a' "$RUNTIME_ENV")" == 'root:root:600' ]] \
+  || { printf 'sealed runtime env must be root:root mode 0600\n' >&2; exit 1; }
+sed -i -E \
+  '/^(TOURNAMENT_INGESTION_PROFILE|PLANNER_MODE|INFO_FETCH_MODE|ENABLE_SCHEDULER|ENABLE_JOB_WORKER|CATALOG_INTERVAL_MS)=/d' \
+  "$RUNTIME_ENV"
+printf '%s\n' \
+  'TOURNAMENT_INGESTION_PROFILE=planner' \
+  'PLANNER_MODE=maintenance' \
+  'INFO_FETCH_MODE=selected_only' \
+  'ENABLE_SCHEDULER=false' \
+  'ENABLE_JOB_WORKER=false' \
+  'CATALOG_INTERVAL_MS=600000' \
+  >>"$RUNTIME_ENV"
+chown root:root "$RUNTIME_ENV"
+chmod 0600 "$RUNTIME_ENV"
 
 POKEROPS_PLANNER_PHASE_A_APPROVED=YES \
 POKEROPS_PLANNER_PGSERVICE="$PLANNER_PGSERVICE" \
