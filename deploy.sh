@@ -2,13 +2,18 @@
 set -Eeuo pipefail
 
 readonly PRIVATE_REPOSITORY='mejechka/pokerops-bootstrap'
+readonly APPLICATION_REPOSITORY='mejechka/po'
 readonly GITHUB_OWNER='mejechka'
 readonly PROJECT_REF='xpajqdsppawnjmvewkep'
+readonly APPLICATION_COMMIT='cec5185b34529078649d28194e7ebf7d6b914493'
 readonly WRAPPER_COMMIT='d6774a908551b9b0a676f2cf00dcdff7255d5c65'
 readonly WRAPPER_SHA256='1de2af5254414825ea71798c404a326faca70696766e6191e4af2686d63e0154'
 readonly PLANNER_PGSERVICE='pokerops-planner-migration'
+readonly PG_SERVICE_FILE='/root/.pg_service.conf'
+readonly INSTALL_ROOT='/opt/pokerops-tournament-ingestion'
 readonly RUNTIME_ENV='/opt/pokerops-tournament-ingestion/shared/.env.tournament.local'
 temporary_root=''
+planner_pgservice=''
 
 die() { printf '%s\n' "$*" >&2; exit 1; }
 
@@ -27,22 +32,162 @@ env_value() {
 }
 
 validate_runtime_env() {
+  local worker_url
   [[ -f "$RUNTIME_ENV" && ! -L "$RUNTIME_ENV" ]] \
     || die 'sealed runtime env is missing or is a symlink'
   [[ "$(stat -c '%U:%G:%a' "$RUNTIME_ENV")" == 'root:root:600' ]] \
     || die 'sealed runtime env must be root:root mode 0600'
   [[ "$(grep -cE '^DATABASE_URL=' "$RUNTIME_ENV")" == '1' ]] \
     || die 'sealed runtime env must contain exactly one DATABASE_URL'
+  worker_url="$(env_value "$RUNTIME_ENV" DATABASE_URL)"
+  [[ "$worker_url" == "postgresql://pokerops_tournament_worker.${PROJECT_REF}:"* ]] \
+    || die 'worker DATABASE_URL is not for the expected restricted role'
+  [[ "$worker_url" == *@* ]] || die 'worker DATABASE_URL is malformed'
+  [[ "$worker_url" =~ ([?&])sslmode=require([&]|$) ]] \
+    || die 'worker DATABASE_URL must require TLS'
+}
+
+pg_service_value() {
+  local file="$1" service="$2" key="$3"
+  awk -v wanted_section="$service" -v wanted_key="$key" '
+    /^[[:space:]]*[#;]/ { next }
+    /^[[:space:]]*\[/ {
+      section = $0
+      sub(/^[[:space:]]*\[/, "", section)
+      sub(/\][[:space:]]*$/, "", section)
+      next
+    }
+    section == wanted_section && index($0, "=") > 0 {
+      current_key = substr($0, 1, index($0, "=") - 1)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", current_key)
+      if (current_key == wanted_key) {
+        value = substr($0, index($0, "=") + 1)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+        print value
+      }
+    }
+  ' "$file"
+}
+
+pg_service_sections() {
+  awk '
+    /^[[:space:]]*\[[^]]+\][[:space:]]*$/ {
+      section = $0
+      sub(/^[[:space:]]*\[/, "", section)
+      sub(/\][[:space:]]*$/, "", section)
+      print section
+    }
+  ' "$PG_SERVICE_FILE"
+}
+
+approved_migration_service() {
+  local service="$1" host port user database sslmode
+  host="$(pg_service_value "$PG_SERVICE_FILE" "$service" host)"
+  port="$(pg_service_value "$PG_SERVICE_FILE" "$service" port)"
+  user="$(pg_service_value "$PG_SERVICE_FILE" "$service" user)"
+  database="$(pg_service_value "$PG_SERVICE_FILE" "$service" dbname)"
+  sslmode="$(pg_service_value "$PG_SERVICE_FILE" "$service" sslmode)"
+  [[ "$database" == 'postgres' ]] || return 1
+  [[ -z "$port" || "$port" == '5432' ]] || return 1
+  [[ "$sslmode" == 'require' || "$sslmode" == 'verify-full' ]] || return 1
+  if [[ "$host" == "db.${PROJECT_REF}.supabase.co" ]]; then
+    [[ "$user" == 'postgres' ]]
+  elif [[ "$host" == *.pooler.supabase.com ]]; then
+    [[ "$user" == "postgres.${PROJECT_REF}" ]]
+  else
+    return 1
+  fi
+}
+
+build_maintenance_url() {
+  local password="$1" host port username
+  host="$(pg_service_value "$PG_SERVICE_FILE" "$planner_pgservice" host)"
+  port="$(pg_service_value "$PG_SERVICE_FILE" "$planner_pgservice" port)"
+  [[ -n "$port" ]] || port='5432'
+  if [[ "$host" == "db.${PROJECT_REF}.supabase.co" ]]; then
+    username='pokerops_tournament_maintenance'
+  elif [[ "$host" == *.pooler.supabase.com ]]; then
+    username="pokerops_tournament_maintenance.${PROJECT_REF}"
+  else
+    die 'approved migration service host changed unexpectedly'
+  fi
+  printf 'postgresql://%s:%s@%s:%s/postgres?sslmode=require&application_name=pokerops-tournament-ingestion\n' \
+    "$username" "$password" "$host" "$port"
+}
+
+resolve_migration_service() {
+  local service approved_count=0
+  [[ -f "$PG_SERVICE_FILE" && ! -L "$PG_SERVICE_FILE" ]] \
+    || die 'root pg_service file is missing or is a symlink'
+  [[ "$(stat -c '%U:%G:%a' "$PG_SERVICE_FILE")" == 'root:root:600' ]] \
+    || die 'root pg_service file must be root:root mode 0600'
+  export PGSERVICEFILE="$PG_SERVICE_FILE"
+
+  if approved_migration_service "$PLANNER_PGSERVICE"; then
+    planner_pgservice="$PLANNER_PGSERVICE"
+    return
+  fi
+  while IFS= read -r service; do
+    [[ -n "$service" ]] || continue
+    if approved_migration_service "$service"; then
+      planner_pgservice="$service"
+      approved_count=$((approved_count + 1))
+    fi
+  done < <(pg_service_sections)
+  [[ "$approved_count" == '1' ]] \
+    || die 'pg_service file must contain exactly one approved PokerOps admin service'
 }
 
 validate_migration_service() {
-  local role database
-  role="$(psql "service=${PLANNER_PGSERVICE}" -X -A -t -v ON_ERROR_STOP=1 -c 'select current_user')" \
+  local role database can_manage_roles
+  role="$(psql "service=${planner_pgservice}" -X -A -t -v ON_ERROR_STOP=1 -c 'select current_user')" \
     || die 'migration service role query failed'
-  database="$(psql "service=${PLANNER_PGSERVICE}" -X -A -t -v ON_ERROR_STOP=1 -c 'select current_database()')" \
+  database="$(psql "service=${planner_pgservice}" -X -A -t -v ON_ERROR_STOP=1 -c 'select current_database()')" \
     || die 'migration service database query failed'
+  can_manage_roles="$(psql "service=${planner_pgservice}" -X -A -t -v ON_ERROR_STOP=1 \
+    -c "select (rolsuper or rolcreaterole)::text from pg_roles where rolname = current_user")" \
+    || die 'migration service authority query failed'
   [[ "$role" != pokerops_tournament_worker* ]] || die 'migration service must not use the worker role'
   [[ "$database" == 'postgres' ]] || die 'migration service must target database postgres'
+  [[ "$can_manage_roles" == 'true' || "$can_manage_roles" == 't' ]] \
+    || die 'migration service cannot create the dedicated maintenance role'
+}
+
+validate_dependencies() {
+  local required
+  for required in bash curl git gh jq sha256sum pg_dump pg_restore psql docker flock df stat awk grep sed tar dd mktemp chmod chown; do
+    command -v "$required" >/dev/null || die "required command is missing: ${required}"
+  done
+  docker compose version >/dev/null 2>&1 || die 'Docker Compose plugin is unavailable'
+}
+
+validate_github_access() {
+  local resolved_application_sha
+  gh auth status --hostname github.com >/dev/null 2>&1 \
+    || die 'root GitHub CLI authentication is required'
+  [[ "$(gh api user --jq '.login' 2>/dev/null)" == "$GITHUB_OWNER" ]] \
+    || die 'root GitHub CLI must be authenticated as mejechka'
+  [[ "$(gh api "repos/${PRIVATE_REPOSITORY}" --jq '.private and (.permissions.pull == true)' 2>/dev/null)" == 'true' ]] \
+    || die 'private bootstrap repository access is required'
+  resolved_application_sha="$(gh api "repos/${APPLICATION_REPOSITORY}/commits/${APPLICATION_COMMIT}" --jq '.sha' 2>/dev/null)" \
+    || die 'exact application commit access is required'
+  [[ "$resolved_application_sha" == "$APPLICATION_COMMIT" ]] \
+    || die 'GitHub resolved an unexpected application commit'
+}
+
+validate_disk_space() {
+  local database_size available required
+  [[ -d "$INSTALL_ROOT" ]] || die 'Tournament ingestion install root is missing'
+  database_size="$(psql "service=${planner_pgservice}" -X -A -t -v ON_ERROR_STOP=1 \
+    -c 'select pg_database_size(current_database())::bigint')" \
+    || die 'database size preflight failed'
+  [[ "$database_size" =~ ^[0-9]+$ ]] || die 'database size preflight returned an invalid value'
+  available="$(df -PB1 -- "$INSTALL_ROOT" | awk 'NR == 2 && $4 ~ /^[0-9]+$/ { print $4 }')" \
+    || die 'backup filesystem free-space preflight failed'
+  [[ "$available" =~ ^[0-9]+$ ]] || die 'backup filesystem free-space preflight returned an invalid value'
+  required=$((database_size * 3 / 2))
+  (( required >= 2147483648 )) || required=2147483648
+  (( available >= required )) || die 'backup filesystem does not have enough free space'
 }
 
 provision_maintenance_role() {
@@ -67,14 +212,19 @@ provision_maintenance_role() {
       "alter role pokerops_tournament_maintenance set idle_in_transaction_session_timeout = '30s';" \
       'alter role pokerops_tournament_maintenance set search_path = public, pg_catalog;' \
       'commit;'
-  } | psql "service=${PLANNER_PGSERVICE}" -X -v ON_ERROR_STOP=1 >/dev/null \
+  } | psql "service=${planner_pgservice}" -X -v ON_ERROR_STOP=1 >/dev/null \
     || die 'maintenance role bootstrap failed'
 }
 
 seal_planner_runtime() {
   local maintenance_url="$1"
-  [[ "$maintenance_url" == "postgresql://pokerops_tournament_maintenance.${PROJECT_REF}:"* ]] \
-    || die 'maintenance URL role is invalid'
+  if [[ "$maintenance_url" =~ ^postgresql://pokerops_tournament_maintenance\.${PROJECT_REF}:[0-9a-f]{64}@[A-Za-z0-9.-]+\.pooler\.supabase\.com:5432/postgres\? ]]; then
+    :
+  elif [[ "$maintenance_url" =~ ^postgresql://pokerops_tournament_maintenance:[0-9a-f]{64}@db\.${PROJECT_REF}\.supabase\.co:5432/postgres\? ]]; then
+    :
+  else
+    die 'maintenance URL role or endpoint is invalid'
+  fi
   [[ "$maintenance_url" =~ ([?&])sslmode=require([&]|$) ]] \
     || die 'maintenance URL must require TLS'
   sed -i -E \
@@ -94,20 +244,17 @@ seal_planner_runtime() {
 }
 
 main() {
-  local phase_a_wrapper worker_url worker_suffix maintenance_password maintenance_url
+  local phase_a_wrapper maintenance_password maintenance_url
   [[ $# -eq 0 ]] || { printf 'usage: deploy.sh\n' >&2; exit 2; }
   [[ "$(id -u)" == '0' ]] || die 'run through sudo bash'
-  for required in gh sha256sum awk grep stat sed dd psql; do
-    command -v "$required" >/dev/null || die "${required} is required"
-  done
   [[ "$WRAPPER_COMMIT" =~ ^[0-9a-f]{40}$ ]] || die 'wrapper commit must be immutable'
 
-  gh auth status --hostname github.com >/dev/null 2>&1 \
-    || die 'root GitHub CLI authentication is required'
-  [[ "$(gh api user --jq '.login' 2>/dev/null)" == "$GITHUB_OWNER" ]] \
-    || die 'root GitHub CLI must be authenticated as mejechka'
-  [[ "$(gh api "repos/${PRIVATE_REPOSITORY}" --jq '.private and (.permissions.pull == true)' 2>/dev/null)" == 'true' ]] \
-    || die 'private bootstrap repository access is required'
+  validate_dependencies
+  validate_github_access
+  validate_runtime_env
+  resolve_migration_service
+  validate_migration_service
+  validate_disk_space
 
   umask 077
   temporary_root="$(mktemp -d /tmp/pokerops-public-entrypoint.XXXXXX)"
@@ -120,22 +267,14 @@ main() {
   printf '%s  %s\n' "$WRAPPER_SHA256" "$phase_a_wrapper" | sha256sum -c - >/dev/null
   chmod 0700 "$phase_a_wrapper"
 
-  validate_runtime_env
-  validate_migration_service
-  worker_url="$(env_value "$RUNTIME_ENV" DATABASE_URL)"
-  [[ "$worker_url" == "postgresql://pokerops_tournament_worker.${PROJECT_REF}:"* ]] \
-    || die 'worker DATABASE_URL is not for the expected restricted role'
-  [[ "$worker_url" == *@* ]] || die 'worker DATABASE_URL is malformed'
-  [[ "$worker_url" =~ ([?&])sslmode=require([&]|$) ]] || die 'worker DATABASE_URL must require TLS'
-  worker_suffix="${worker_url#*@}"
   maintenance_password="$(dd if=/dev/urandom bs=32 count=1 2>/dev/null | sha256sum | awk '{print $1}')"
   provision_maintenance_role "$maintenance_password"
-  maintenance_url="postgresql://pokerops_tournament_maintenance.${PROJECT_REF}:${maintenance_password}@${worker_suffix}"
+  maintenance_url="$(build_maintenance_url "$maintenance_password")"
   seal_planner_runtime "$maintenance_url"
-  unset maintenance_password maintenance_url worker_url worker_suffix
+  unset maintenance_password maintenance_url
 
   POKEROPS_PLANNER_PHASE_A_APPROVED=YES \
-  POKEROPS_PLANNER_PGSERVICE="$PLANNER_PGSERVICE" \
+  POKEROPS_PLANNER_PGSERVICE="$planner_pgservice" \
     bash "$phase_a_wrapper"
 }
 
