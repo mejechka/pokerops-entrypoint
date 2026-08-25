@@ -329,13 +329,21 @@ provision_maintenance_role() {
       "select pg_advisory_xact_lock(hashtextextended('pokerops_planner_role_bootstrap', 0));" \
       'do $maintenance_role$' \
       'begin' \
+      '  if exists (' \
+      '    select 1' \
+      '    from pg_roles' \
+      "    where rolname = 'pokerops_tournament_maintenance'" \
+      '      and (rolsuper or rolcreatedb or rolcreaterole or rolreplication or rolbypassrls)' \
+      '  ) then' \
+      "    raise exception 'existing maintenance role has forbidden privileges';" \
+      '  end if;' \
       "  if not exists (select 1 from pg_roles where rolname = 'pokerops_tournament_maintenance') then" \
       '    create role pokerops_tournament_maintenance login nosuperuser nocreatedb nocreaterole' \
       '      noreplication nobypassrls inherit connection limit 1;' \
       '  end if;' \
       'end' \
       '$maintenance_role$;'
-    printf "alter role pokerops_tournament_maintenance login nosuperuser nocreatedb nocreaterole noreplication nobypassrls inherit connection limit 1 password '%s';\n" "$password"
+    printf "alter role pokerops_tournament_maintenance login inherit connection limit 1 password '%s';\n" "$password"
     printf '%s\n' \
       "alter role pokerops_tournament_maintenance set statement_timeout = '60s';" \
       "alter role pokerops_tournament_maintenance set lock_timeout = '5s';" \
